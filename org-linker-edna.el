@@ -43,6 +43,8 @@
 (declare-function org-get-heading "ext:org")
 (declare-function org-agenda-files "ext:org")
 (declare-function org-reveal "ext:org")
+(declare-function org-current-level "ext:org")
+(declare-function org-map-entries "ext:org")
 (declare-function org-ql-select "ext:org-ql")
 (eval-when-compile (require 'org-macs))
 (defvar org-todo-keywords-1)
@@ -257,6 +259,94 @@ OPTIONS-STR is an optional filter/sort options string."
   (let ((finder (plist-get finder-info :finder))
         (args (plist-get finder-info :args-str)))
     (concat finder args (or options-str ""))))
+
+
+;;; Relatives builder
+
+(defvar org-linker-edna--rel-selections
+  '("from-top" "from-bottom" "from-current"
+    "forward-no-wrap" "backward-no-wrap" "backward-wrap"
+    "walk-up" "walk-up-with-self"
+    "walk-down" "walk-down-with-self" "step-down")
+  "Selection modes for the relatives finder.")
+
+(defvar org-linker-edna--rel-sorts
+  '("(none)" "random-sort"
+    "priority-up" "priority-down"
+    "effort-up" "effort-down"
+    "scheduled-up" "scheduled-down"
+    "deadline-up" "deadline-down"
+    "timestamp-up" "timestamp-down")
+  "Sort options for the relatives finder.")
+
+(defun org-linker-edna--build-relatives-string ()
+  "Interactively build a relatives() finder string.
+Guides through selection, filtering, and sorting phases.
+Returns the complete relatives(...) string."
+  ;; Phase 1: Selection mode
+  (let* ((selection (completing-read "Selection mode: "
+                                     org-linker-edna--rel-selections nil t))
+         ;; Phase 2: Filters
+         (filters (completing-read-multiple
+                   "Filters (optional): "
+                   org-linker-edna-finder-options))
+         (tag-input (read-string
+                     "Tag filter (+tag or -tag, empty to skip): "))
+         (regex-input (read-string
+                       "Heading regex (empty to skip): "))
+         (limit-input (read-string
+                       "Result limit (number, empty for all): "))
+         ;; Phase 3: Sort
+         (sort-choice (completing-read "Sort: "
+                                       org-linker-edna--rel-sorts nil t))
+         (reverse-p (when (not (string= sort-choice "(none)"))
+                      (y-or-n-p "Reverse sort? ")))
+         ;; Assemble options
+         (opts (list selection)))
+    (setq opts (append opts filters))
+    (when (not (string-blank-p tag-input))
+      (setq opts (append opts (list (format "\"%s\"" tag-input)))))
+    (when (not (string-blank-p regex-input))
+      (setq opts (append opts (list (format "\"%s\"" regex-input)))))
+    (when (not (string-blank-p limit-input))
+      (setq opts (append opts (list limit-input))))
+    (unless (string= sort-choice "(none)")
+      (setq opts (append opts (list sort-choice))))
+    (when reverse-p
+      (setq opts (append opts (list "reverse-sort"))))
+    (format "relatives(%s)" (mapconcat #'identity opts " "))))
+
+;;;###autoload
+(defun org-linker-edna-relatives-builder ()
+  "Build a relatives() finder and set it as TRIGGER or BLOCKER.
+The relatives finder is org-edna's most powerful finder, with
+composable selection, filtering, and sorting phases."
+  (interactive)
+  (org-back-to-heading)
+  (let* ((property (completing-read "Set property: "
+                                    '("TRIGGER" "BLOCKER") nil t))
+         (finder-str (org-linker-edna--build-relatives-string)))
+    (if (string= property "TRIGGER")
+        (let* ((actions-plist (org-linker-edna-actions-dispatcher))
+               (action-str (cl-loop for (key value) on actions-plist
+                                    by #'cddr
+                                    concat (org-linker-edna--format-action
+                                            key value)))
+               (existing (org-entry-get (point) property))
+               (new-value (string-trim
+                           (concat (or existing "")
+                                   " " finder-str action-str))))
+          (org-entry-put (point) property new-value)
+          (message "TRIGGER: %s%s" finder-str action-str))
+      (let* ((consideration (org-linker-edna--select-consideration))
+             (condition (org-linker-edna--select-blocker-condition))
+             (existing (org-entry-get (point) property))
+             (new-value (string-trim
+                         (concat (or existing "")
+                                 consideration
+                                 " " finder-str condition))))
+        (org-entry-put (point) property new-value)
+        (message "BLOCKER:%s %s%s" consideration finder-str condition)))))
 
 
 ;;; Action dispatching — all 12 org-edna trigger actions
@@ -584,6 +674,103 @@ Reports missing IDs, malformed syntax, and orphaned references."
       (message "All BLOCKER/TRIGGER properties are valid."))))
 
 
+;;; Presets — common dependency patterns
+
+;;;###autoload
+(defun org-linker-edna-preset-sequential ()
+  "Preset: make heading sequential with its siblings.
+Sets BLOCKER: previous-sibling and
+TRIGGER: next-sibling todo!(TODO)."
+  (interactive)
+  (org-back-to-heading)
+  (org-entry-put (point) "BLOCKER" "previous-sibling")
+  (org-entry-put (point) "TRIGGER" "next-sibling todo!(TODO)")
+  (message "Sequential: blocked by prev, triggers next"))
+
+;;;###autoload
+(defun org-linker-edna-preset-parent-gates ()
+  "Preset: when this heading is done, activate all children.
+Sets TRIGGER: children todo!(TODO)."
+  (interactive)
+  (org-back-to-heading)
+  (org-entry-put (point) "TRIGGER" "children todo!(TODO)")
+  (message "Parent gates: children activated when done"))
+
+;;;###autoload
+(defun org-linker-edna-preset-children-gate ()
+  "Preset: block this heading until all children are done.
+Sets BLOCKER: children."
+  (interactive)
+  (org-back-to-heading)
+  (org-entry-put (point) "BLOCKER" "children")
+  (message "Children gate: blocked until all children done"))
+
+;;;###autoload
+(defun org-linker-edna-preset-first-child-cascade ()
+  "Preset: when this heading is done, activate first child only.
+Sets TRIGGER: first-child todo!(TODO).
+Combine with sequential children for a full cascade."
+  (interactive)
+  (org-back-to-heading)
+  (org-entry-put (point) "TRIGGER" "first-child todo!(TODO)")
+  (message "First-child cascade: first child activated when done"))
+
+
+;;; Batch operations — apply patterns to subtrees
+
+;;;###autoload
+(defun org-linker-edna-batch-sequential ()
+  "Make all direct children of heading at point sequential.
+Each child (except the first) gets BLOCKER: previous-sibling.
+Each child (except the last) gets TRIGGER: next-sibling todo!(TODO)."
+  (interactive)
+  (org-back-to-heading)
+  (let ((parent-level (org-current-level))
+        (first t)
+        (count 0)
+        last-child-pos)
+    (save-excursion
+      (org-map-entries
+       (lambda ()
+         (when (= (org-current-level) (1+ parent-level))
+           (cl-incf count)
+           (setq last-child-pos (point))
+           (if first
+               (progn
+                 (org-entry-put (point) "TRIGGER"
+                                "next-sibling todo!(TODO)")
+                 (setq first nil))
+             (org-entry-put (point) "BLOCKER" "previous-sibling")
+             (org-entry-put (point) "TRIGGER"
+                            "next-sibling todo!(TODO)"))))
+       nil 'tree))
+    ;; Last child has no next sibling to trigger
+    (when last-child-pos
+      (save-excursion
+        (goto-char last-child-pos)
+        (org-entry-delete (point) "TRIGGER")))
+    (message "Made %d children sequential" count)))
+
+;;;###autoload
+(defun org-linker-edna-batch-clear ()
+  "Remove all BLOCKER and TRIGGER properties from this subtree.
+Includes the heading at point and all descendants."
+  (interactive)
+  (org-back-to-heading)
+  (when (y-or-n-p "Remove all BLOCKER/TRIGGER from this subtree? ")
+    (let ((count 0))
+      (save-excursion
+        (org-map-entries
+         (lambda ()
+           (when (or (org-entry-get (point) "BLOCKER")
+                     (org-entry-get (point) "TRIGGER"))
+             (cl-incf count)
+             (org-entry-delete (point) "BLOCKER")
+             (org-entry-delete (point) "TRIGGER")))
+         nil 'tree))
+      (message "Cleared dependencies from %d headings" count))))
+
+
 ;;; Help
 
 ;;;###autoload
@@ -640,7 +827,8 @@ Reports missing IDs, malformed syntax, and orphaned references."
         ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
        ["Create (finder-based)"
         ("T" "Trigger with finder" org-linker-edna-trigger-finder)
-        ("B" "Blocker with finder" org-linker-edna-blocker-finder)]]
+        ("B" "Blocker with finder" org-linker-edna-blocker-finder)
+        ("R" "Relatives builder" org-linker-edna-relatives-builder)]]
       [["Navigate"
         ("g" "Goto dependency" org-linker-edna-goto)
         ("s" "Show dependencies" org-linker-edna-show-deps)]
@@ -648,7 +836,15 @@ Reports missing IDs, malformed syntax, and orphaned references."
         ("r" "Remove dependency" org-linker-edna-remove)
         ("e" "Edit raw property" org-linker-edna-edit-raw)
         ("v" "Validate all" org-linker-edna-validate)
-        ("?" "Action reference" org-linker-edna-action-help)]]))
+        ("?" "Action reference" org-linker-edna-action-help)]]
+      [["Presets"
+        ("1" "Sequential sibling" org-linker-edna-preset-sequential)
+        ("2" "Parent gates children" org-linker-edna-preset-parent-gates)
+        ("3" "Children gate parent" org-linker-edna-preset-children-gate)
+        ("4" "First-child cascade" org-linker-edna-preset-first-child-cascade)]
+       ["Batch"
+        ("!" "Make children sequential" org-linker-edna-batch-sequential)
+        ("X" "Clear subtree deps" org-linker-edna-batch-clear)]]))
   (org-linker-edna-menu--transient))
 
 
