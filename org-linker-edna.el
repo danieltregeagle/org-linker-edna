@@ -69,6 +69,42 @@ Called with no arguments at the heading."
 Common actions are listed first.")
 
 
+;;; Finder definitions
+
+(defvar org-linker-edna-finders
+  '(;; Relative — tree navigation (no args needed)
+    ("self"                  :type relative)
+    ("parent"                :type relative)
+    ("children"              :type relative)
+    ("first-child"           :type relative)
+    ("siblings"              :type relative)
+    ("next-sibling"          :type relative)
+    ("previous-sibling"      :type relative)
+    ("next-sibling-wrap"     :type relative)
+    ("previous-sibling-wrap" :type relative)
+    ("rest-of-siblings"      :type relative)
+    ("rest-of-siblings-wrap" :type relative)
+    ("ancestors"             :type relative)
+    ("descendants"           :type relative)
+    ;; Absolute — need arguments
+    ("match"    :type absolute :prompt match)
+    ("olp"      :type absolute :prompt olp)
+    ("file"     :type absolute :prompt file)
+    ("org-file" :type absolute :prompt org-file))
+  "Available org-edna finders with their types.")
+
+(defvar org-linker-edna-finder-options
+  '("todo-only" "todo-and-done-only" "no-comment" "no-archive")
+  "Filter options available for relative finders.")
+
+(defvar org-linker-edna-blocker-conditions
+  '("(default: all DONE)" "done?" "!done?"
+    "todo-state?" "!todo-state?"
+    "has-property?" "!has-property?"
+    "has-tags?" "!has-tags?")
+  "Available blocker condition keywords.")
+
+
 ;;; Core helpers
 
 (defun org-linker-edna-ids (s)
@@ -129,6 +165,98 @@ Appends SOURCE's ID to TARGET's existing IDs, deduplicating."
   (let ((ids-str (format "ids%s"
                         (org-linker-edna-set-prop source target "BLOCKER"))))
     (org-entry-put target "BLOCKER" ids-str)))
+
+
+;;; Finder selection helpers
+
+(defun org-linker-edna--select-finder ()
+  "Prompt user to select an org-edna finder.
+Returns a plist (:finder NAME :args-str STRING :type TYPE)."
+  (let* ((finder-names (mapcar #'car org-linker-edna-finders))
+         (finder (completing-read "Finder: " finder-names nil t))
+         (finder-def (assoc finder org-linker-edna-finders))
+         (type (plist-get (cdr finder-def) :type))
+         (prompt-type (plist-get (cdr finder-def) :prompt))
+         (args-str (org-linker-edna--prompt-finder-args prompt-type)))
+    (list :finder finder :args-str args-str :type type)))
+
+(defun org-linker-edna--prompt-finder-args (prompt-type)
+  "Prompt for finder arguments based on PROMPT-TYPE.
+Returns formatted argument string, or empty string if none needed."
+  (pcase prompt-type
+    ('match
+     (let ((spec (read-string
+                  "Match spec (e.g. TODO=\"TODO\"+project): ")))
+       (format "(\"%s\")" spec)))
+    ('olp
+     (let ((file (read-file-name "Org file: "))
+           (path (read-string "Outline path (e.g. Projects/Sub): ")))
+       (format "(\"%s\" \"%s\")" file path)))
+    ('file
+     (let ((file (read-file-name "File: ")))
+       (format "(\"%s\")" file)))
+    ('org-file
+     (let ((file (read-string "File (relative to org-directory): ")))
+       (format "(\"%s\")" file)))
+    (_ "")))
+
+(defun org-linker-edna--select-finder-options ()
+  "Prompt for optional filter/sort options for relative finders.
+Returns formatted options string (with leading space), or empty."
+  (let* ((opts (completing-read-multiple
+                "Filter options (optional, comma-separated): "
+                org-linker-edna-finder-options))
+         (tag-input (read-string
+                     "Tag filter (+tag or -tag, empty to skip): "))
+         (all-opts (append opts
+                          (when (not (string-blank-p tag-input))
+                            (list tag-input)))))
+    (if all-opts
+        (concat " " (mapconcat #'identity all-opts " "))
+      "")))
+
+(defun org-linker-edna--select-blocker-condition ()
+  "Prompt for an optional blocker condition.
+Returns formatted condition string (with leading space), or empty."
+  (let ((condition (completing-read "Blocker condition: "
+                                    org-linker-edna-blocker-conditions
+                                    nil t)))
+    (pcase condition
+      ("(default: all DONE)" "")
+      ((or "todo-state?" "!todo-state?")
+       (let ((state (completing-read "State: "
+                                     org-todo-keywords-1 nil t)))
+         (format " %s(%s)" condition state)))
+      ((or "has-property?" "!has-property?")
+       (let ((prop (read-string "Property: "))
+             (val (read-string "Value: ")))
+         (format " %s(\"%s\" \"%s\")" condition prop val)))
+      ((or "has-tags?" "!has-tags?")
+       (let ((tags (read-string "Tags (space-separated): ")))
+         (format " %s(%s)" condition tags)))
+      (_ (format " %s" condition)))))
+
+(defun org-linker-edna--select-consideration ()
+  "Prompt for optional consideration modifier for blockers.
+Returns formatted string (with leading space), or empty."
+  (let ((choice (completing-read
+                 "Consideration: "
+                 '("(default)" "any" "all" "number") nil t)))
+    (pcase choice
+      ("(default)" "")
+      ("number"
+       (let ((n (read-number "Minimum count: ")))
+         (format " consider(%d)" n)))
+      (_ (format " consider(%s)" choice)))))
+
+(defun org-linker-edna--build-finder-string (finder-info
+                                             &optional options-str)
+  "Build the finder portion of an edna property string.
+FINDER-INFO is a plist from `org-linker-edna--select-finder'.
+OPTIONS-STR is an optional filter/sort options string."
+  (let ((finder (plist-get finder-info :finder))
+        (args (plist-get finder-info :args-str)))
+    (concat finder args (or options-str ""))))
 
 
 ;;; Action dispatching — all 12 org-edna trigger actions
@@ -255,6 +383,54 @@ With \\[universal-argument], search only the current file.
 With \\[universal-argument] \\[universal-argument], search narrowed buffer."
   (interactive)
   (org-linker 'org-linker-edna-blocker-callback))
+
+
+;;;###autoload
+(defun org-linker-edna-trigger-finder ()
+  "Set TRIGGER on heading at point using an org-edna finder.
+Unlike `org-linker-edna' which links to a specific heading via
+ids, this uses structural finders (children, siblings, etc.)
+that org-edna resolves dynamically."
+  (interactive)
+  (org-back-to-heading)
+  (let* ((finder-info (org-linker-edna--select-finder))
+         (options (when (eq (plist-get finder-info :type) 'relative)
+                   (org-linker-edna--select-finder-options)))
+         (finder-str (org-linker-edna--build-finder-string
+                      finder-info options))
+         (actions-plist (org-linker-edna-actions-dispatcher))
+         (action-str (cl-loop for (key value) on actions-plist by #'cddr
+                              concat (org-linker-edna--format-action
+                                      key value)))
+         (existing (org-entry-get (point) "TRIGGER"))
+         (new-value (string-trim
+                     (concat (or existing "")
+                             (format " %s%s" finder-str action-str)))))
+    (org-entry-put (point) "TRIGGER" new-value)
+    (message "TRIGGER: %s%s" finder-str action-str)))
+
+;;;###autoload
+(defun org-linker-edna-blocker-finder ()
+  "Set BLOCKER on heading at point using an org-edna finder.
+Unlike `org-linker-edna-blocker' which links to a specific heading
+via ids, this uses structural finders (children, siblings, etc.)
+that org-edna resolves dynamically."
+  (interactive)
+  (org-back-to-heading)
+  (let* ((finder-info (org-linker-edna--select-finder))
+         (options (when (eq (plist-get finder-info :type) 'relative)
+                   (org-linker-edna--select-finder-options)))
+         (finder-str (org-linker-edna--build-finder-string
+                      finder-info options))
+         (consideration (org-linker-edna--select-consideration))
+         (condition (org-linker-edna--select-blocker-condition))
+         (existing (org-entry-get (point) "BLOCKER"))
+         (new-value (string-trim
+                     (concat (or existing "")
+                             consideration
+                             (format " %s%s" finder-str condition)))))
+    (org-entry-put (point) "BLOCKER" new-value)
+    (message "BLOCKER:%s %s%s" consideration finder-str condition)))
 
 
 ;;; Interactive commands — Navigate
@@ -459,17 +635,19 @@ Reports missing IDs, malformed syntax, and orphaned references."
   (unless (fboundp 'org-linker-edna-menu--transient)
     (transient-define-prefix org-linker-edna-menu--transient ()
       "Org-Edna dependency management."
-      [["Create"
+      [["Create (ID-based)"
         ("t" "Trigger  (current -> target)" org-linker-edna)
         ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
-       ["Navigate"
+       ["Create (finder-based)"
+        ("T" "Trigger with finder" org-linker-edna-trigger-finder)
+        ("B" "Blocker with finder" org-linker-edna-blocker-finder)]]
+      [["Navigate"
         ("g" "Goto dependency" org-linker-edna-goto)
-        ("s" "Show dependencies" org-linker-edna-show-deps)]]
-      [["Manage"
+        ("s" "Show dependencies" org-linker-edna-show-deps)]
+       ["Manage"
         ("r" "Remove dependency" org-linker-edna-remove)
         ("e" "Edit raw property" org-linker-edna-edit-raw)
-        ("v" "Validate all" org-linker-edna-validate)]
-       ["Help"
+        ("v" "Validate all" org-linker-edna-validate)
         ("?" "Action reference" org-linker-edna-action-help)]]))
   (org-linker-edna-menu--transient))
 
