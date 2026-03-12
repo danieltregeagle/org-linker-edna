@@ -117,7 +117,7 @@ Returns alist of (DISPLAY-STRING . ID-STRING) for completing-read."
   "Return an ID list string for PROPERTY.
 Appends SOURCE's ID to TARGET's existing IDs, deduplicating."
   (let* ((existing-ids (org-linker-edna-ids
-                        (org-entry-get (marker-position target) property)))
+                        (org-entry-get target property)))
          (source-id (concat "\"id:" (org-linker-edna-get-or-create-id-for-marker source) "\""))
          (all-ids (if (member source-id existing-ids)
                       existing-ids
@@ -126,9 +126,9 @@ Appends SOURCE's ID to TARGET's existing IDs, deduplicating."
 
 (defun org-linker-edna-set-blocker (source target)
   "Set BLOCKER property on TARGET with SOURCE's ID."
-  (org-entry-put (marker-position target) "BLOCKER"
-                 (format "ids%s"
-                         (org-linker-edna-set-prop source target "BLOCKER"))))
+  (let ((ids-str (format "ids%s"
+                        (org-linker-edna-set-prop source target "BLOCKER"))))
+    (org-entry-put target "BLOCKER" ids-str)))
 
 
 ;;; Action dispatching — all 12 org-edna trigger actions
@@ -199,9 +199,9 @@ Uses `completing-read-multiple' with all available actions."
          (action-str (cl-loop for (key value) on actions-plist by #'cddr
                               concat (org-linker-edna--format-action
                                       key value)))
-         (existing-trigger (org-entry-get (marker-position target) "TRIGGER"))
-         (id-string (org-linker-edna-set-prop source target "TRIGGER")))
-    (org-entry-put (marker-position target) "TRIGGER"
+         (id-string (org-linker-edna-set-prop source target "TRIGGER"))
+         (existing-trigger (org-entry-get target "TRIGGER")))
+    (org-entry-put target "TRIGGER"
                    (string-trim
                     (concat existing-trigger
                             (format " ids%s" id-string)
@@ -459,18 +459,18 @@ Reports missing IDs, malformed syntax, and orphaned references."
   (unless (fboundp 'org-linker-edna-menu--transient)
     (transient-define-prefix org-linker-edna-menu--transient ()
       "Org-Edna dependency management."
-      ["Create dependency"
-       ("t" "Trigger  (current -> target)" org-linker-edna)
-       ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
-      ["Navigate & inspect"
-       ("g" "Goto dependency" org-linker-edna-goto)
-       ("s" "Show dependencies" org-linker-edna-show-deps)]
-      ["Manage"
-       ("r" "Remove dependency" org-linker-edna-remove)
-       ("e" "Edit raw property" org-linker-edna-edit-raw)
-       ("v" "Validate all" org-linker-edna-validate)]
-      ["Help"
-       ("?" "Action reference" org-linker-edna-action-help)]))
+      [["Create"
+        ("t" "Trigger  (current -> target)" org-linker-edna)
+        ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
+       ["Navigate"
+        ("g" "Goto dependency" org-linker-edna-goto)
+        ("s" "Show dependencies" org-linker-edna-show-deps)]]
+      [["Manage"
+        ("r" "Remove dependency" org-linker-edna-remove)
+        ("e" "Edit raw property" org-linker-edna-edit-raw)
+        ("v" "Validate all" org-linker-edna-validate)]
+       ["Help"
+        ("?" "Action reference" org-linker-edna-action-help)]]))
   (org-linker-edna-menu--transient))
 
 
