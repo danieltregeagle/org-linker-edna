@@ -163,10 +163,22 @@ Appends SOURCE's ID to TARGET's existing IDs, deduplicating."
     (concat "(" (mapconcat #'identity all-ids " ") ")")))
 
 (defun org-linker-edna-set-blocker (source target)
-  "Set BLOCKER property on TARGET with SOURCE's ID."
-  (let ((ids-str (format "ids%s"
-                        (org-linker-edna-set-prop source target "BLOCKER"))))
-    (org-entry-put target "BLOCKER" ids-str)))
+  "Append SOURCE's ID to BLOCKER on TARGET, preserving all existing tokens.
+Deduplicates: if the ID is already present it is not added again."
+  (let* ((existing (org-entry-get target "BLOCKER"))
+         (existing-ids (org-linker-edna-ids existing))
+         (source-id (concat "\"id:" (org-linker-edna-get-or-create-id-for-marker source) "\""))
+         (new-ids (if (member source-id existing-ids)
+                      existing-ids
+                    (append existing-ids (list source-id))))
+         (ids-block (concat "ids(" (mapconcat #'identity new-ids " ") ")"))
+         (rest (when existing
+                 (string-trim
+                  (replace-regexp-in-string "ids([^)]*)" "" existing))))
+         (parts (delq nil (list ids-block
+                                (when (and rest (not (string-blank-p rest))) rest))))
+         (new-val (string-trim (mapconcat #'identity parts " "))))
+    (org-entry-put target "BLOCKER" new-val)))
 
 
 ;;; Finder selection helpers
@@ -412,18 +424,26 @@ Uses `completing-read-multiple' with all available actions."
     (mapcan #'org-linker-edna-action-dispatcher selected)))
 
 (defun org-linker-edna-set-trigger (source target)
-  "Set TRIGGER property on TARGET with SOURCE's ID and actions."
-  (let* ((actions-plist (org-linker-edna-actions-dispatcher))
+  "Append SOURCE's ID and actions to TRIGGER on TARGET, preserving all existing tokens.
+Deduplicates IDs: if already present, skips adding it but still appends actions."
+  (let* ((existing (org-entry-get target "TRIGGER"))
+         (existing-ids (org-linker-edna-ids existing))
+         (source-id (concat "\"id:" (org-linker-edna-get-or-create-id-for-marker source) "\""))
+         (new-ids (if (member source-id existing-ids)
+                      existing-ids
+                    (append existing-ids (list source-id))))
+         (ids-block (concat "ids(" (mapconcat #'identity new-ids " ") ")"))
+         (rest (when existing
+                 (string-trim
+                  (replace-regexp-in-string "ids([^)]*)" "" existing))))
+         (actions-plist (org-linker-edna-actions-dispatcher))
          (action-str (cl-loop for (key value) on actions-plist by #'cddr
-                              concat (org-linker-edna--format-action
-                                      key value)))
-         (id-string (org-linker-edna-set-prop source target "TRIGGER"))
-         (existing-trigger (org-entry-get target "TRIGGER")))
-    (org-entry-put target "TRIGGER"
-                   (string-trim
-                    (concat existing-trigger
-                            (format " ids%s" id-string)
-                            action-str)))))
+                              concat (org-linker-edna--format-action key value)))
+         (parts (delq nil (list ids-block
+                                (when (and rest (not (string-blank-p rest))) rest)
+                                (when (not (string-blank-p action-str)) action-str))))
+         (new-val (string-trim (mapconcat #'identity parts " "))))
+    (org-entry-put target "TRIGGER" new-val)))
 
 
 ;;; Callbacks
@@ -477,21 +497,17 @@ With \\[universal-argument] \\[universal-argument], search narrowed buffer."
 
 ;;;###autoload
 (defun org-linker-edna-trigger-finder ()
-  "Set TRIGGER on heading at point using an org-edna finder.
-Unlike `org-linker-edna' which links to a specific heading via
-ids, this uses structural finders (children, siblings, etc.)
-that org-edna resolves dynamically."
+  "Append a finder-based TRIGGER on heading at point.
+Prompts for a finder and actions, then appends them to any existing TRIGGER."
   (interactive)
   (org-back-to-heading)
   (let* ((finder-info (org-linker-edna--select-finder))
          (options (when (eq (plist-get finder-info :type) 'relative)
                    (org-linker-edna--select-finder-options)))
-         (finder-str (org-linker-edna--build-finder-string
-                      finder-info options))
+         (finder-str (org-linker-edna--build-finder-string finder-info options))
          (actions-plist (org-linker-edna-actions-dispatcher))
          (action-str (cl-loop for (key value) on actions-plist by #'cddr
-                              concat (org-linker-edna--format-action
-                                      key value)))
+                              concat (org-linker-edna--format-action key value)))
          (existing (org-entry-get (point) "TRIGGER"))
          (new-value (string-trim
                      (concat (or existing "")
@@ -501,17 +517,14 @@ that org-edna resolves dynamically."
 
 ;;;###autoload
 (defun org-linker-edna-blocker-finder ()
-  "Set BLOCKER on heading at point using an org-edna finder.
-Unlike `org-linker-edna-blocker' which links to a specific heading
-via ids, this uses structural finders (children, siblings, etc.)
-that org-edna resolves dynamically."
+  "Append a finder-based BLOCKER on heading at point.
+Prompts for a finder, consideration, and condition, then appends to any existing BLOCKER."
   (interactive)
   (org-back-to-heading)
   (let* ((finder-info (org-linker-edna--select-finder))
          (options (when (eq (plist-get finder-info :type) 'relative)
                    (org-linker-edna--select-finder-options)))
-         (finder-str (org-linker-edna--build-finder-string
-                      finder-info options))
+         (finder-str (org-linker-edna--build-finder-string finder-info options))
          (consideration (org-linker-edna--select-consideration))
          (condition (org-linker-edna--select-blocker-condition))
          (existing (org-entry-get (point) "BLOCKER"))
@@ -587,36 +600,113 @@ that org-edna resolves dynamically."
 
 ;;; Interactive commands — Manage
 
+(defun org-linker-edna--split-edna-tokens (s)
+  "Split edna property string S into top-level tokens.
+Tokens are split on whitespace except inside parentheses.
+Returns a list of non-empty token strings."
+  (let ((tokens nil)
+        (current "")
+        (depth 0))
+    (dolist (ch (string-to-list s))
+      (cond
+       ((= ch ?\() (cl-incf depth) (setq current (concat current (string ch))))
+       ((= ch ?\)) (cl-decf depth) (setq current (concat current (string ch))))
+       ((and (= depth 0) (memq ch '(?\s ?\t ?\n)))
+        (when (not (string-blank-p current))
+          (push current tokens))
+        (setq current ""))
+       (t (setq current (concat current (string ch))))))
+    (when (not (string-blank-p current))
+      (push current tokens))
+    (nreverse tokens)))
+
+(defun org-linker-edna--collect-all-tokens (property)
+  "Collect all removable tokens from PROPERTY at point.
+Returns an alist of (DISPLAY-STRING . TOKEN-STRING).
+ID-based tokens show the heading text; predicate/action tokens show as-is."
+  (let* ((prop-val (org-entry-get (point) property))
+         result)
+    (when prop-val
+      ;; Collect ID-based tokens (individual IDs within ids(...))
+      (let ((ids (org-linker-edna-ids prop-val)))
+        (dolist (id-str ids)
+          (let* ((bare-id (replace-regexp-in-string "\"id:\\|\"" "" id-str))
+                 (loc (org-id-find bare-id))
+                 (heading (if loc
+                              (with-current-buffer (find-file-noselect (car loc))
+                                (save-excursion
+                                  (goto-char (cdr loc))
+                                  (org-get-heading t t t t)))
+                            (format "[missing: %s]" bare-id))))
+            (push (cons (format "[id] %s  (%s)" heading bare-id) id-str)
+                  result))))
+      ;; Collect non-ID tokens: strip ids(...) blocks, tokenize the rest
+      ;; Each top-level whitespace-separated token (respecting parens) is removable
+      (let* ((stripped (replace-regexp-in-string "ids([^)]*)" "" prop-val))
+             (words (org-linker-edna--split-edna-tokens (string-trim stripped))))
+        (dolist (w words)
+          (push (cons (format "[pred] %s" w) w) result))))
+    (nreverse result)))
+
 ;;;###autoload
 (defun org-linker-edna-remove ()
-  "Remove a dependency from the heading at point.
-Prompts to select a BLOCKER or TRIGGER ID to remove."
+  "Remove a dependency token from the heading at point.
+Shows all BLOCKER or TRIGGER tokens — both ID-based and predicate-based
+(e.g. previous-sibling, children) — so any can be selected for removal."
   (interactive)
   (org-back-to-heading)
   (let* ((property (completing-read "Remove from property: "
                                     '("BLOCKER" "TRIGGER") nil t))
-         (candidates (org-linker-edna--collect-ids-with-headings property)))
-    (unless candidates
-      (user-error "No %s IDs on this heading" property))
-    (let* ((selected (completing-read
-                      (format "Remove %s: " property) candidates nil t))
-           (id-str (cdr (assoc selected candidates)))
-           (prop-val (org-entry-get (point) property))
-           (all-ids (org-linker-edna-ids prop-val))
-           (remaining (remove id-str all-ids)))
-      (if remaining
-          (let ((new-ids (concat "ids("
-                                 (mapconcat #'identity remaining " ")
-                                 ")")))
-            (if (string= property "TRIGGER")
-                ;; Preserve action portion (todo!, scheduled!, etc.)
-                (let ((actions (replace-regexp-in-string
-                                "ids([^)]*)" "" prop-val)))
-                  (org-entry-put (point) property
-                                 (string-trim (concat new-ids actions))))
-              (org-entry-put (point) property new-ids)))
-        (org-entry-delete (point) property))
-      (message "Removed %s from %s" id-str property))))
+         (prop-val (org-entry-get (point) property)))
+    (unless prop-val
+      (user-error "No %s property on this heading" property))
+    (let* ((candidates (org-linker-edna--collect-all-tokens property)))
+      (unless candidates
+        (user-error "No removable tokens in %s" property))
+      (let* ((selected (completing-read
+                        (format "Remove %s token: " property) candidates nil t))
+             (token (cdr (assoc selected candidates))))
+        (if (string-prefix-p "\"id:" token)
+            ;; ID token: rebuild ids(...) without this entry, preserve rest
+            (let* ((all-ids (org-linker-edna-ids prop-val))
+                   (remaining (remove token all-ids))
+                   (rest (string-trim
+                          (replace-regexp-in-string "ids([^)]*)" "" prop-val))))
+              (if remaining
+                  (let ((new-ids (concat "ids("
+                                         (mapconcat #'identity remaining " ")
+                                         ")")))
+                    (org-entry-put (point) property
+                                   (string-trim (concat new-ids " " rest))))
+                (if (string-blank-p rest)
+                    (org-entry-delete (point) property)
+                  (org-entry-put (point) property rest))))
+          ;; Predicate/action token: remove by re-tokenizing and filtering
+          (let* ((all-tokens (org-linker-edna--split-edna-tokens
+                              (string-trim
+                               (replace-regexp-in-string "ids([^)]*)" "" prop-val))))
+                 (removed nil)
+                 (remaining-preds (cl-remove-if
+                                   (lambda (tok)
+                                     (if (and (not removed) (string= tok token))
+                                         (progn (setq removed tok) t)
+                                       nil))
+                                   all-tokens))
+                 ;; Rebuild: ids block (if any) + remaining predicates
+                 (ids-block (when (org-linker-edna-ids prop-val)
+                              (concat "ids("
+                                      (mapconcat #'identity
+                                                 (org-linker-edna-ids prop-val)
+                                                 " ")
+                                      ")")))
+                 (parts (delq nil (list ids-block
+                                        (when remaining-preds
+                                          (mapconcat #'identity remaining-preds " ")))))
+                 (new-val (string-trim (mapconcat #'identity parts " "))))
+            (if (string-blank-p new-val)
+                (org-entry-delete (point) property)
+              (org-entry-put (point) property new-val))))
+        (message "Removed [%s] from %s" token property)))))
 
 ;;;###autoload
 (defun org-linker-edna-edit-raw ()
@@ -678,42 +768,104 @@ Reports missing IDs, malformed syntax, and orphaned references."
 
 ;;;###autoload
 (defun org-linker-edna-preset-sequential ()
-  "Preset: make heading sequential with its siblings.
-Sets BLOCKER: previous-sibling and
-TRIGGER: next-sibling todo!(TODO)."
+  "Toggle sequential-sibling dependency on the heading at point.
+Toggles previous-sibling in BLOCKER and next-sibling todo!(TODO) in TRIGGER.
+If both are already present, removes them; otherwise adds them."
   (interactive)
   (org-back-to-heading)
-  (org-entry-put (point) "BLOCKER" "previous-sibling")
-  (org-entry-put (point) "TRIGGER" "next-sibling todo!(TODO)")
-  (message "Sequential: blocked by prev, triggers next"))
+  (let* ((blocker (org-entry-get (point) "BLOCKER"))
+         (trigger (org-entry-get (point) "TRIGGER"))
+         (b-tokens (when blocker (org-linker-edna--split-edna-tokens (string-trim blocker))))
+         (t-tokens (when trigger (org-linker-edna--split-edna-tokens (string-trim trigger))))
+         (has-blocker (member "previous-sibling" b-tokens))
+         (has-trigger-finder (member "next-sibling" t-tokens))
+         (removing (and has-blocker has-trigger-finder)))
+    (if removing
+        (progn
+          (let* ((rb (delete "previous-sibling" (copy-sequence b-tokens)))
+                 (new-b (string-trim (mapconcat #'identity rb " "))))
+            (if (string-blank-p new-b)
+                (org-entry-delete (point) "BLOCKER")
+              (org-entry-put (point) "BLOCKER" new-b)))
+          (let* ((rt (cl-remove-if (lambda (tok)
+                                     (member tok '("next-sibling" "todo!(TODO)")))
+                                   (copy-sequence t-tokens)))
+                 (new-t (string-trim (mapconcat #'identity rt " "))))
+            (if (string-blank-p new-t)
+                (org-entry-delete (point) "TRIGGER")
+              (org-entry-put (point) "TRIGGER" new-t)))
+          (message "Removed sequential-sibling dependency"))
+      (progn
+        (org-entry-put (point) "BLOCKER"
+                       (string-trim (concat (or blocker "") " previous-sibling")))
+        (org-entry-put (point) "TRIGGER"
+                       (string-trim (concat (or trigger "") " next-sibling todo!(TODO)")))
+        (message "Added sequential-sibling dependency")))))
 
 ;;;###autoload
 (defun org-linker-edna-preset-parent-gates ()
-  "Preset: when this heading is done, activate all children.
-Sets TRIGGER: children todo!(TODO)."
+  "Toggle children todo!(TODO) in the TRIGGER property at point.
+If both tokens are already present, removes them; otherwise appends them."
   (interactive)
   (org-back-to-heading)
-  (org-entry-put (point) "TRIGGER" "children todo!(TODO)")
-  (message "Parent gates: children activated when done"))
+  (let* ((existing (org-entry-get (point) "TRIGGER"))
+         (tokens (when existing (org-linker-edna--split-edna-tokens (string-trim existing))))
+         (has-finder (member "children" tokens))
+         (has-action (member "todo!(TODO)" tokens)))
+    (if (and has-finder has-action)
+        (let* ((remaining (cl-remove-if (lambda (tok)
+                                          (member tok '("children" "todo!(TODO)")))
+                                        (copy-sequence tokens)))
+               (new-val (string-trim (mapconcat #'identity remaining " "))))
+          (if (string-blank-p new-val)
+              (org-entry-delete (point) "TRIGGER")
+            (org-entry-put (point) "TRIGGER" new-val))
+          (message "Removed parent-gates trigger"))
+      (org-entry-put (point) "TRIGGER"
+                     (string-trim (concat (or existing "") " children todo!(TODO)")))
+      (message "Added parent-gates trigger"))))
 
 ;;;###autoload
 (defun org-linker-edna-preset-children-gate ()
-  "Preset: block this heading until all children are done.
-Sets BLOCKER: children."
+  "Toggle children in the BLOCKER property at point.
+If already present, removes it; otherwise appends it."
   (interactive)
   (org-back-to-heading)
-  (org-entry-put (point) "BLOCKER" "children")
-  (message "Children gate: blocked until all children done"))
+  (let* ((existing (org-entry-get (point) "BLOCKER"))
+         (tokens (when existing (org-linker-edna--split-edna-tokens (string-trim existing)))))
+    (if (member "children" tokens)
+        (let* ((remaining (delete "children" (copy-sequence tokens)))
+               (new-val (string-trim (mapconcat #'identity remaining " "))))
+          (if (string-blank-p new-val)
+              (org-entry-delete (point) "BLOCKER")
+            (org-entry-put (point) "BLOCKER" new-val))
+          (message "Removed children blocker"))
+      (org-entry-put (point) "BLOCKER"
+                     (string-trim (concat (or existing "") " children")))
+      (message "Added children blocker"))))
 
 ;;;###autoload
-(defun org-linker-edna-preset-first-child-cascade ()
-  "Preset: when this heading is done, activate first child only.
-Sets TRIGGER: first-child todo!(TODO).
-Combine with sequential children for a full cascade."
+(defun org-linker-edna-preset-previous-sibling ()
+  "Toggle previous-sibling in the BLOCKER property at point.
+If previous-sibling is already present, removes it.
+Otherwise appends it, preserving any existing blocker tokens."
   (interactive)
   (org-back-to-heading)
-  (org-entry-put (point) "TRIGGER" "first-child todo!(TODO)")
-  (message "First-child cascade: first child activated when done"))
+  (let* ((existing (org-entry-get (point) "BLOCKER"))
+         (tokens (when existing
+                   (org-linker-edna--split-edna-tokens (string-trim existing))))
+         (already-p (member "previous-sibling" tokens)))
+    (if already-p
+        (let* ((remaining (delete "previous-sibling" (copy-sequence tokens)))
+               (new-val (string-trim (mapconcat #'identity remaining " "))))
+          (if (string-blank-p new-val)
+              (org-entry-delete (point) "BLOCKER")
+            (org-entry-put (point) "BLOCKER" new-val))
+          (message "Removed previous-sibling from BLOCKER"))
+      (let ((new-val (string-trim
+                      (concat (or existing "") " previous-sibling"))))
+        (org-entry-put (point) "BLOCKER" new-val)
+        (message "Added previous-sibling to BLOCKER")))))
 
 
 ;;; Batch operations — apply patterns to subtrees
@@ -841,7 +993,7 @@ Includes the heading at point and all descendants."
         ("1" "Sequential sibling" org-linker-edna-preset-sequential)
         ("2" "Parent gates children" org-linker-edna-preset-parent-gates)
         ("3" "Children gate parent" org-linker-edna-preset-children-gate)
-        ("4" "First-child cascade" org-linker-edna-preset-first-child-cascade)]
+        ("4" "Previous sibling blocker" org-linker-edna-preset-previous-sibling)]
        ["Batch"
         ("!" "Make children sequential" org-linker-edna-batch-sequential)
         ("X" "Clear subtree deps" org-linker-edna-batch-clear)]]))
