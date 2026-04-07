@@ -113,7 +113,7 @@ Common actions are listed first.")
   "Return a list of ids found in S.
 S is a string formatted as org edna ids property value."
   (when s
-    (when (string-match "ids(\\([^\\)]*\\)).*" s)
+    (when (string-match "ids(\\([^)]*\\)).*" s)
       (split-string (match-string 1 s)))))
 
 (defun org-linker-edna-get-or-create-id-for-marker (m)
@@ -138,12 +138,12 @@ Returns alist of (DISPLAY-STRING . ID-STRING) for completing-read."
          result)
     (dolist (id-str ids (nreverse result))
       (let* ((bare-id (replace-regexp-in-string
-                       "\"id:\\|\"" "" id-str))
-             (loc (org-id-find bare-id))
-             (heading (if loc
-                         (with-current-buffer (find-file-noselect (car loc))
+                       "^\"id:\\|\"$" "" id-str))
+             (marker (org-id-find bare-id 'marker))
+             (heading (if marker
+                         (with-current-buffer (marker-buffer marker)
                            (save-excursion
-                             (goto-char (cdr loc))
+                             (goto-char (marker-position marker))
                              (org-get-heading t t t t)))
                        (format "[missing: %s]" bare-id))))
         (push (cons (format "%s  (%s)" heading bare-id) id-str) result)))))
@@ -558,7 +558,7 @@ Prompts for a finder, consideration, and condition, then appends to any existing
       (user-error "No dependencies on this heading"))
     (let* ((choice (completing-read "Goto dependency: " all nil t))
            (id-str (cdr (assoc choice all)))
-           (bare-id (replace-regexp-in-string "\"id:\\|\"" "" id-str))
+           (bare-id (replace-regexp-in-string "^\"id:\\|\"$" "" id-str))
            (marker (org-id-find bare-id 'marker)))
       (unless marker
         (user-error "Cannot find heading for ID %s" bare-id))
@@ -630,12 +630,12 @@ ID-based tokens show the heading text; predicate/action tokens show as-is."
       ;; Collect ID-based tokens (individual IDs within ids(...))
       (let ((ids (org-linker-edna-ids prop-val)))
         (dolist (id-str ids)
-          (let* ((bare-id (replace-regexp-in-string "\"id:\\|\"" "" id-str))
-                 (loc (org-id-find bare-id))
-                 (heading (if loc
-                              (with-current-buffer (find-file-noselect (car loc))
+          (let* ((bare-id (replace-regexp-in-string "^\"id:\\|\"$" "" id-str))
+                 (marker (org-id-find bare-id 'marker))
+                 (heading (if marker
+                              (with-current-buffer (marker-buffer marker)
                                 (save-excursion
-                                  (goto-char (cdr loc))
+                                  (goto-char (marker-position marker))
                                   (org-get-heading t t t t)))
                             (format "[missing: %s]" bare-id))))
             (push (cons (format "[id] %s  (%s)" heading bare-id) id-str)
@@ -748,7 +748,7 @@ Reports missing IDs, malformed syntax, and orphaned references."
                      problems))
              (dolist (id-str ids)
                (let ((bare-id (replace-regexp-in-string
-                                "\"id:\\|\"" "" id-str)))
+                                "^\"id:\\|\"$" "" id-str)))
                  (unless (org-id-find bare-id)
                    (push (format "%s:%d — %s %s references missing ID: %s"
                                  (file-name-nondirectory file)
