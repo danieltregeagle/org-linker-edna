@@ -650,9 +650,10 @@ ID-based tokens show the heading text; predicate/action tokens show as-is."
 
 ;;;###autoload
 (defun org-linker-edna-remove ()
-  "Remove a dependency token from the heading at point.
+  "Remove one or more dependency tokens from the heading at point.
 Shows all BLOCKER or TRIGGER tokens — both ID-based and predicate-based
-(e.g. previous-sibling, children) — so any can be selected for removal."
+(e.g. previous-sibling, children) — and accepts comma-separated selection
+for removing multiple tokens at once."
   (interactive)
   (org-back-to-heading)
   (let* ((property (completing-read "Remove from property: "
@@ -663,50 +664,37 @@ Shows all BLOCKER or TRIGGER tokens — both ID-based and predicate-based
     (let* ((candidates (org-linker-edna--collect-all-tokens property)))
       (unless candidates
         (user-error "No removable tokens in %s" property))
-      (let* ((selected (completing-read
-                        (format "Remove %s token: " property) candidates nil t))
-             (token (cdr (assoc selected candidates))))
-        (if (string-prefix-p "\"id:" token)
-            ;; ID token: rebuild ids(...) without this entry, preserve rest
-            (let* ((all-ids (org-linker-edna-ids prop-val))
-                   (remaining (remove token all-ids))
-                   (rest (string-trim
-                          (replace-regexp-in-string "ids([^)]*)" "" prop-val))))
-              (if remaining
-                  (let ((new-ids (concat "ids("
-                                         (mapconcat #'identity remaining " ")
-                                         ")")))
-                    (org-entry-put (point) property
-                                   (string-trim (concat new-ids " " rest))))
-                (if (string-blank-p rest)
-                    (org-entry-delete (point) property)
-                  (org-entry-put (point) property rest))))
-          ;; Predicate/action token: remove by re-tokenizing and filtering
-          (let* ((all-tokens (org-linker-edna--split-edna-tokens
-                              (string-trim
-                               (replace-regexp-in-string "ids([^)]*)" "" prop-val))))
-                 (removed nil)
-                 (remaining-preds (cl-remove-if
-                                   (lambda (tok)
-                                     (if (and (not removed) (string= tok token))
-                                         (progn (setq removed tok) t)
-                                       nil))
-                                   all-tokens))
-                 ;; Rebuild: ids block (if any) + remaining predicates
-                 (ids-block (when (org-linker-edna-ids prop-val)
-                              (concat "ids("
-                                      (mapconcat #'identity
-                                                 (org-linker-edna-ids prop-val)
-                                                 " ")
-                                      ")")))
-                 (parts (delq nil (list ids-block
-                                        (when remaining-preds
-                                          (mapconcat #'identity remaining-preds " ")))))
-                 (new-val (string-trim (mapconcat #'identity parts " "))))
-            (if (string-blank-p new-val)
-                (org-entry-delete (point) property)
-              (org-entry-put (point) property new-val))))
-        (message "Removed [%s] from %s" token property)))))
+      (let* ((selected-list (completing-read-multiple
+                             (format "Remove %s tokens (comma-separated): " property)
+                             candidates nil t))
+             (tokens-to-remove (mapcar (lambda (s) (cdr (assoc s candidates)))
+                                       selected-list)))
+        (unless tokens-to-remove
+          (user-error "No tokens selected"))
+        ;; Partition into ID tokens and predicate tokens
+        (let* ((id-tokens (cl-remove-if-not (lambda (tok) (string-prefix-p "\"id:" tok))
+                                             tokens-to-remove))
+               (pred-tokens (cl-remove-if (lambda (tok) (string-prefix-p "\"id:" tok))
+                                          tokens-to-remove))
+               ;; Rebuild IDs: keep those not in id-tokens
+               (all-ids (org-linker-edna-ids prop-val))
+               (remaining-ids (cl-remove-if (lambda (id) (member id id-tokens)) all-ids))
+               ;; Rebuild predicates: keep those not in pred-tokens
+               (rest (string-trim (replace-regexp-in-string "ids([^)]*)" "" prop-val)))
+               (all-pred-tokens (org-linker-edna--split-edna-tokens rest))
+               (remaining-preds (cl-remove-if (lambda (tok) (member tok pred-tokens))
+                                              all-pred-tokens))
+               ;; Assemble new value
+               (ids-block (when remaining-ids
+                            (concat "ids(" (mapconcat #'identity remaining-ids " ") ")")))
+               (parts (delq nil (list ids-block
+                                      (when remaining-preds
+                                        (mapconcat #'identity remaining-preds " ")))))
+               (new-val (string-trim (mapconcat #'identity parts " "))))
+          (if (string-blank-p new-val)
+              (org-entry-delete (point) property)
+            (org-entry-put (point) property new-val))
+          (message "Removed %d token(s) from %s" (length tokens-to-remove) property))))))
 
 ;;;###autoload
 (defun org-linker-edna-edit-raw ()
@@ -962,6 +950,56 @@ Includes the heading at point and all descendants."
       (insert "  consider(N)      Block if >= N match\n"))))
 
 
+;;;###autoload
+(defun org-linker-edna-finder-help ()
+  "Display a reference of all org-edna finder and filter keywords."
+  (interactive)
+  (with-help-window "*Org Edna Finders*"
+    (with-current-buffer "*Org Edna Finders*"
+      (insert "Org-Edna Finders Reference\n")
+      (insert (make-string 44 ?=) "\n\n")
+      (insert "RELATIVE FINDERS  (no arguments)\n")
+      (insert "  self                       The heading itself\n")
+      (insert "  parent                     Direct parent\n")
+      (insert "  children                   All direct children\n")
+      (insert "  first-child                First child only\n")
+      (insert "  siblings                   All siblings (excl. self)\n")
+      (insert "  next-sibling               Next sibling\n")
+      (insert "  previous-sibling           Previous sibling\n")
+      (insert "  next-sibling-wrap          Next sibling, wraps\n")
+      (insert "  previous-sibling-wrap      Previous sibling, wraps\n")
+      (insert "  rest-of-siblings           All following siblings\n")
+      (insert "  rest-of-siblings-wrap      (wrapping)\n")
+      (insert "  ancestors                  All ancestor headings\n")
+      (insert "  descendants                All descendant headings\n\n")
+      (insert "ABSOLUTE FINDERS  (with arguments)\n")
+      (insert "  ids(\"id:UUID\" ...)         By org ID(s)\n")
+      (insert "  match(\"TAGS/PROP\")         By tag/property match\n")
+      (insert "  olp(\"file\" \"h1/h2\")        By outline path\n")
+      (insert "  file(\"path\")               All headings in file\n")
+      (insert "  org-file(\"name\")           File in org-directory\n\n")
+      (insert "RELATIVES FINDER  (composable — use R to build)\n")
+      (insert "  relatives(SELECTION FILTERS SORT)\n")
+      (insert "  Selections: from-top  from-bottom  from-current\n")
+      (insert "    forward-no-wrap  backward-no-wrap  backward-wrap\n")
+      (insert "    walk-up  walk-up-with-self\n")
+      (insert "    walk-down  walk-down-with-self  step-down\n\n")
+      (insert (make-string 44 ?-) "\n")
+      (insert "FILTER OPTIONS  (append after a relative finder)\n")
+      (insert "  todo-only              Only TODO-state entries\n")
+      (insert "  todo-and-done-only     TODO + DONE, skip unset\n")
+      (insert "  no-comment             Skip COMMENT headings\n")
+      (insert "  no-archive             Skip archived headings\n")
+      (insert "  +tag  -tag             Require / exclude a tag\n\n")
+      (insert "COMMON EXAMPLES\n")
+      (insert "  BLOCKER: children\n")
+      (insert "  BLOCKER: previous-sibling\n")
+      (insert "  BLOCKER: ids(\"id:abc-123\")\n")
+      (insert "  TRIGGER: children todo!(TODO)\n")
+      (insert "  TRIGGER: next-sibling todo!(TODO)\n")
+      (insert "  TRIGGER: rest-of-siblings todo!(HOLD)\n"))))
+
+
 ;;; Transient menu
 
 ;;;###autoload
@@ -969,35 +1007,34 @@ Includes the heading at point and all descendants."
   "Org-Edna dependency management transient menu."
   (interactive)
   (require 'transient)
-  ;; Define the transient on first call, then invoke it
-  (declare-function org-linker-edna-menu--transient "org-linker-edna")
-  (unless (fboundp 'org-linker-edna-menu--transient)
-    (transient-define-prefix org-linker-edna-menu--transient ()
-      "Org-Edna dependency management."
-      [["Create (ID-based)"
-        ("t" "Trigger  (current -> target)" org-linker-edna)
-        ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
-       ["Create (finder-based)"
-        ("T" "Trigger with finder" org-linker-edna-trigger-finder)
-        ("B" "Blocker with finder" org-linker-edna-blocker-finder)
-        ("R" "Relatives builder" org-linker-edna-relatives-builder)]]
-      [["Navigate"
-        ("g" "Goto dependency" org-linker-edna-goto)
-        ("s" "Show dependencies" org-linker-edna-show-deps)]
-       ["Manage"
-        ("r" "Remove dependency" org-linker-edna-remove)
-        ("e" "Edit raw property" org-linker-edna-edit-raw)
-        ("v" "Validate all" org-linker-edna-validate)
-        ("?" "Action reference" org-linker-edna-action-help)]]
-      [["Presets"
-        ("1" "Sequential sibling" org-linker-edna-preset-sequential)
-        ("2" "Parent gates children" org-linker-edna-preset-parent-gates)
-        ("3" "Children gate parent" org-linker-edna-preset-children-gate)
-        ("4" "Previous sibling blocker" org-linker-edna-preset-previous-sibling)]
-       ["Batch"
-        ("!" "Make children sequential" org-linker-edna-batch-sequential)
-        ("X" "Clear subtree deps" org-linker-edna-batch-clear)]]))
   (org-linker-edna-menu--transient))
+
+(transient-define-prefix org-linker-edna-menu--transient ()
+  "Org-Edna dependency management."
+  [["Create (ID-based)"
+    ("t" "Trigger  (current -> target)" org-linker-edna)
+    ("b" "Blocker  (target -> current)" org-linker-edna-blocker)]
+   ["Create (finder-based)"
+    ("T" "Trigger with finder" org-linker-edna-trigger-finder)
+    ("B" "Blocker with finder" org-linker-edna-blocker-finder)
+    ("R" "Relatives builder" org-linker-edna-relatives-builder)]]
+  [["Navigate"
+    ("g" "Goto dependency" org-linker-edna-goto)
+    ("s" "Show dependencies" org-linker-edna-show-deps)]
+   ["Manage"
+    ("r" "Remove dependency" org-linker-edna-remove)
+    ("e" "Edit raw property" org-linker-edna-edit-raw)
+    ("v" "Validate all" org-linker-edna-validate)
+    ("?" "Action reference" org-linker-edna-action-help)
+    ("/" "Finder reference" org-linker-edna-finder-help)]]
+  [["Presets"
+    ("1" "Sequential sibling" org-linker-edna-preset-sequential)
+    ("2" "Parent gates children" org-linker-edna-preset-parent-gates)
+    ("3" "Children gate parent" org-linker-edna-preset-children-gate)
+    ("4" "Previous sibling blocker" org-linker-edna-preset-previous-sibling)]
+   ["Batch"
+    ("!" "Make children sequential" org-linker-edna-batch-sequential)
+    ("X" "Clear subtree deps" org-linker-edna-batch-clear)]])
 
 
 ;;; Embark integration
